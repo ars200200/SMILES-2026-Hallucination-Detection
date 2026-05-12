@@ -50,7 +50,7 @@ def split_data(
         Replace or extend the skeleton below.  The only contract is that the
         function returns the list described above.
     """
-
+ 
     idx = np.arange(len(y))
     y_int = y.astype(int)
 
