@@ -20,6 +20,17 @@ from __future__ import annotations
 import torch
 
 
+def _unique_layer_indices(n_layers: int, offsets: tuple[int, ...]) -> list[int]:
+    """Return valid, de-duplicated layer indices for negative offsets."""
+    indices: list[int] = []
+    for offset in offsets:
+        idx = n_layers + offset if offset < 0 else offset
+        idx = max(0, min(n_layers - 1, idx))
+        if idx not in indices:
+            indices.append(idx)
+    return indices
+
+
 def aggregate(
     hidden_states: torch.Tensor,
     attention_mask: torch.Tensor,
@@ -41,21 +52,34 @@ def aggregate(
         Replace or extend the skeleton below with alternative layer selection,
         token pooling (mean, max, weighted), or multi-layer fusion strategies.
     """
-    # ------------------------------------------------------------------
-    # STUDENT: Replace or extend the aggregation below.
-    # ------------------------------------------------------------------
+    valid_mask = attention_mask.to(device=hidden_states.device).bool()
+    valid_positions = valid_mask.nonzero(as_tuple=False).flatten()
+    if valid_positions.numel() == 0:
+        raise ValueError("attention_mask must contain at least one real token")
 
-    # Default: last real token of the final transformer layer.
-    layer = hidden_states[-1]          # (seq_len, hidden_dim)
+    last_pos = int(valid_positions[-1].item())
+    recent_positions = valid_positions[-64:]
+    selected_layers = _unique_layer_indices(
+        hidden_states.shape[0],
+        offsets=(-8, -6, -4, -2, -1),
+    )
 
-    # Find the index of the last real (non-padding) token.
-    real_positions = attention_mask.nonzero(as_tuple=False)  # (n_real, 1)
-    last_pos = int(real_positions[-1].item())                 # scalar index
+    pooled_features: list[torch.Tensor] = []
+    for layer_idx in selected_layers:
+        layer = hidden_states[layer_idx]  # (seq_len, hidden_dim)
+        valid_tokens = layer[valid_positions]
+        recent_tokens = layer[recent_positions]
 
-    feature = layer[last_pos]          # (hidden_dim,)
+        pooled_features.extend(
+            [
+                layer[last_pos],
+                recent_tokens.mean(dim=0),
+                valid_tokens.mean(dim=0),
+                recent_tokens.std(dim=0, unbiased=False),
+            ]
+        )
 
-    return feature
-    # ------------------------------------------------------------------
+    return torch.cat(pooled_features, dim=0)
 
 
 def extract_geometric_features(
@@ -81,12 +105,36 @@ def extract_geometric_features(
         norms, inter-layer cosine similarity (representation drift), or
         sequence length.
     """
-    # ------------------------------------------------------------------
-    # STUDENT: Replace or extend the geometric feature extraction below.
-    # ------------------------------------------------------------------
+    valid_mask = attention_mask.to(device=hidden_states.device).bool()
+    valid_positions = valid_mask.nonzero(as_tuple=False).flatten()
+    if valid_positions.numel() == 0:
+        raise ValueError("attention_mask must contain at least one real token")
 
-    # Placeholder: returns an empty tensor (no geometric features).
-    return torch.zeros(0)
+    selected_layers = _unique_layer_indices(
+        hidden_states.shape[0],
+        offsets=(-8, -6, -4, -2, -1),
+    )
+    layer_means = torch.stack(
+        [hidden_states[idx, valid_positions].mean(dim=0) for idx in selected_layers]
+    )
+    layer_norms = torch.linalg.vector_norm(layer_means, dim=1)
+
+    if layer_means.shape[0] > 1:
+        cosines = torch.nn.functional.cosine_similarity(
+            layer_means[:-1],
+            layer_means[1:],
+            dim=1,
+        )
+    else:
+        cosines = torch.zeros(0, device=hidden_states.device)
+
+    seq_len = torch.tensor(
+        [float(valid_positions.numel()) / float(attention_mask.numel())],
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+
+    return torch.cat([layer_norms, cosines, seq_len], dim=0)
 
 
 def aggregation_and_feature_extraction(
